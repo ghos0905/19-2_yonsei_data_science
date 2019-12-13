@@ -1,0 +1,429 @@
+---
+layout: page
+title: "DVD Rental Service Analysis"
+author: "최호식"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    toc: yes
+    toc_float: true
+    highlight: tango
+    code_folding: show
+    number_section: false
+    self_contained: true
+editor_options: 
+  chunk_output_type: console
+mainfont: NanumGothic
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = 'center')
+```
+
+![](https://imgur.com/e98tdUf.jpg)
+
+# R과 PostgreSQL 연동 준비
+
+## 0.1 라이브러리 호출
+- `RPostgreSQL` PostgreSQL 과 R의 연동을 위한 라이브러리
+- `DBI` 데이터베이스에 접속을 위한 라이브러리
+- `tidyverse` 데이터프레임 후속 작업을 위한 `dplyr` 패키지 내장
+
+```{r}
+library(RPostgreSQL)
+library(DBI)
+library(tidyverse)
+```
+
+## 0.2 프로세스 진행 도구
+- `dbDriver` PostgreSQL과 연동시킨다.
+- `dbConnect` 데이터베이스 접근에 필요한 정보를 입력하고 데이터베이스와 연결한다.
+- `dbGetQuery` 쿼리를 작성하여 원하는 데이터를 가져온다.
+- `dplyr %>%` 후속작업을 진행하기 위한 동사.
+
+```{r}
+pg <- dbDriver("PostgreSQL")
+
+con <- dbConnect(pg, dbname='dvdrental',
+                 port='5432',
+                 user='postgres',
+                 password='kairos9549',
+                 host='localhost')
+```
+
+## 0.3 전체적인 구조 살피기
+
+### 0.3.1 데이터 내용
+**Rent A Film** 이라는 DVD 렌탈 회사의 데이터 베이스를 가지고 선택적으로 관심있는 내용을 분석해본다. 데이터 베이스 파일명은 dvdrental.tar 이고 [다운로드 링크](http://www.postgresqltutorial.com/postgresql-sample-database/) 에서 하단에 Download PostgreSQL sample database 에서 주황색 단추를 클릭하면 데이터 베이스를 다운받을 수 있다.
+
+### 0.3.2 작업에 필요한 테이블 조사
+postgre에 있는 public 테이블들을 불러온다.  
+`actor` `store` `adress` `category` `city` `country` `film` `film_category` `rental` `inventory` 등의 테이블을 파악할 수 있다.
+```{r}
+tables <- "SELECT *
+        FROM pg_catalog.pg_tables"
+
+dbGetQuery(con, tables) %>% 
+  filter(schemaname == 'public') 
+```
+
+### 0.3.3 테이블 별 칼럼 조사
+테이블 마다 어떤 칼럼들이 존재하는지 살펴본다.
+
+```{r}
+columns <- "SELECT table_name,
+            STRING_AGG(column_name,',') AS columns
+            
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            GROUP BY table_name"
+
+dbGetQuery(con,
+            columns
+            ) %>% 
+  DT::datatable()
+```
+
+### 0.3.4 ER 다이어그램
+테이블 간 관계를 살필 수 있다. 추후 쿼리 작업 시 테이블 **연결 순서**에 큰 참고가 되었다.
+
+![](https://imgur.com/TrncOVT.jpg)
+
+# TOPIC 1
+*“What are the top and least rented (in-demand) genres and what are what are their total sales?"*  
+
+### TOPIC 1.1
+장르별 영화 전체 수요량과 전체 판매금액 2개 테이블을 WITH 동사로 따로 편성한다. SELECT와 JOIN으로 장르 칼럼에 맞춰 병합시키고 최종적으로 원하는 테이블을 만든다.  
+t1 테이블에 장르명, 장르로 GROUP BY한 총수요량 을 만들고  
+t2 테이블에 장르명, 장르로 GROUP BY한 총매출량 을 만든다.
+```{r Topic1}
+dbGetQuery(con,
+           "
+           WITH t1 AS (SELECT category.name AS genre, count(customer.customer_id) AS Total_rent_demand
+           FROM category 
+           JOIN film_category
+           USING (category_id)
+           JOIN film
+           USING(film_id)
+           JOIN inventory
+           USING(film_id)
+           JOIN rental
+           USING(inventory_id)
+           JOIN customer
+           USING(customer_id)
+           group by genre
+           order by Total_rent_demand DESC ),
+           
+           t2 AS (SELECT category.name AS genre, sum(payment.amount) AS Total_Sale
+           FROM category
+           JOIN film_category
+           USING(category_id)
+           JOIN film
+           USING(film_id)
+           JOIN inventory
+           USING(film_id)
+           JOIN rental
+           USING(inventory_id)
+           JOIN payment
+           USING(rental_id)
+           group by genre
+           order by Total_Sale DESC
+           )
+           
+           SELECT t1.genre , t1.Total_rent_demand , t2.Total_Sale
+           FROM t1
+           JOIN t2
+           ON t1.genre = t2.genre
+           ") %>% 
+  DT::datatable()
+```
+  
+  
+렌트 수요량에서는 스포츠, 애니메이션, 액션 장르가 TOP 3를 기록하고, 음악, 여행, 호러 장르가 하위 3위를 기록했다.  
+총매출에서는 스포츠, 사이언스픽션, 애니메이션 장르가 TOP 3,  
+음악, 여행, 아동 장르가 하위 3위를 기록했다.
+
+
+### TOPIC 1.2 Try another solution
+위에서 장르별 영화 총 수요량과 총 매출액의 2개 테이블로 따로 구성하고 병합시켜서 최종으로 원하는 테이블을 하나로 만들려고 시도했다.  
+구하고 싶은 칼럼들을 한번에 연결지어서 쿼리 처리 작업의 효율성을 위해 테이블 하나로 표현해보고자 하였다.
+하지만, 수정 보완해야할 점이 있음을 알게됐다. 결과가 다르게 나왔는데, 한번에 조인을 해서 테이블 하나로 필요한 값들을 쓰려는 과정에서 문제가 생긴 것 같다.  
+무조건 작업 과정을 줄이려는게 오류를 부를 가능성이 증가됨을 알게되었다.
+```{r}
+dbGetQuery(con,
+           "
+           SELECT name as genre, count(customer.customer_id) as number_rental , sum(amount)
+           FROM category
+           JOIN film_category
+           USING(category_id)
+           JOIN film
+           USING(film_id)
+           JOIN inventory
+           USING(film_id)
+           JOIN rental
+           USING(inventory_id)
+           JOIN customer
+           USING(customer_id)
+           JOIN payment
+           USING(rental_id)
+           
+           GROUP BY 1
+           ORDER BY 2 DESC
+           
+           ") %>% 
+  DT::datatable()
+```
+
+# TOPIC 2
+*"Can we know how many distinct users have rented each genre?"*  
+  
+카테고리 명 칼럼을 장르 칼럼으로 하고, 장르마다 렌트한 이용자id를 distinct 하게 카운트한 컬럼을 만들었다.
+```{r Q2}
+dbGetQuery(con,
+           "
+           SELECT category.name AS genre, count(DISTINCT customer.customer_id) AS Distict_customer
+           FROM category
+           JOIN film_category
+           USING(category_id)
+           JOIN film
+           USING(film_id)
+           JOIN inventory
+           USING(film_id)
+           JOIN rental
+           USING(inventory_id)
+           JOIN customer
+           USING(customer_id)
+           group by 1
+           order by 2 DESC
+           ") %>% 
+  DT::datatable()
+```
+  
+  
+고객 층에서 스포츠, 액션, 사이언스 픽션 장르이 TOP 3를 기록하고,  
+여행, 음악, 호러 장르가 하위 3위를 기록했다.  
+
+# TOPIC 3
+*"What is the average rental rate for each genre? (from the highest to the lowest)"*  
+  
+카테고리 테이블에서 name 을 장르 칼럼으로 설정하고, 카데고리 id로 연결한 필름 id 수의 평균을 구한 칼럼을 만들었다.
+```{r Q3}
+dbGetQuery(con,
+           "
+           SELECT name genre , AVG(film.rental_rate) average_rental_rate
+           FROM category
+           JOIN film_category
+           USING(category_id)
+           JOIN film
+           USING(film_id)
+           group by genre
+           order by average_rental_rate DESC
+           ") %>% 
+  DT::datatable()
+```
+  
+  
+게임, 여행, 사이언스 픽션 장르가 평균 렌트율 TOP 3를 차지했다.  
+액션, 다큐멘터리, 클래식 장르가 하위 3위를 차지했다.  
+
+# TOPIC 4
+*"How many rented films were returned late, early, and on time?"*  
+  
+4.1은 필요한 칼럼을 위해 t1, t2 테이블을 with 하여 최종 테이블을 만들었고, 4.2는 같은 목적을 작업 효율화 취지로 쿼리를 만들어 보았다.  
+
+### TOPIC 4.1
+t1 에 반납일-렌트일로 렌트 기간 칼럼을 구하고, t2 에 렌트 기간을 비교연산자로 범주로 표시한 칼럼을 구했다.  
+t1과 t2를 이용하여 렌트 상태를 기준으로 빌린 필름 수를 group by하여 카운트한 칼럼을 만들었다.
+```{r}
+dbGetQuery(con,
+           "
+           with t1 as(SELECT inventory_id , DATE_PART('day', return_date - rental_date) as date_diffrence
+           FROM rental
+           ),
+           
+           t2 as (SELECT rental_duration , date_diffrence,
+           CASE
+           when rental_duration = date_diffrence then 'on time'
+           when rental_duration > date_diffrence then 'early'
+           else 'late'
+           end as rental_status
+           FROM film
+           JOIN inventory
+           USING(film_id)
+           JOIN t1
+           USING(inventory_id)
+           )
+           
+           SELECT rental_status ,count(*) as number_of_film
+           FROM t2
+           GROUP BY rental_status
+           ORDER BY number_of_film DESC
+           ") %>% 
+  DT::datatable()
+```
+
+  
+연체율이 전체 3/5를 차지할 정도로 높았다. 연체비에 따른 추가 소득이 있을 것으로 예상된다.  
+
+
+### TOPIC 4.2 another solution
+필요한 테이블들을 JOIN 해서 만들어진 테이블에서 칼럼들을 이용하여 필요한 칼럼을 만들었다.  
+t1, t2 프로세스로 나누지않고 한번의 조인으로 테이블 연결 작업 과정을 줄여서 효율을 높이고자 하였다.  
+결과는 똑같이 나왔다.
+```{r}
+dbGetQuery(con,
+           "SELECT 
+           CASE
+           WHEN rental_duration = DATE_PART('day',return_date - rental_date) THEN 'on time'
+           WHEN rental_duration > DATE_PART('day',return_date - rental_date) THEN 'early'
+           ELSE 'late'
+           END AS STATUS
+           , count(*) AS number_of_status
+           
+           FROM film
+           JOIN inventory
+           USING(film_id)
+           JOIN rental
+           USING(inventory_id)
+           
+           GROUP BY STATUS
+           ORDER BY number_of_status DESC") %>% 
+  DT::datatable()
+```
+
+
+# TOPIC 5
+*"In which countries does Rent A Film have a presence and what is the customer base in each country? What are the total sales in each country? (from most to least)"*  
+  
+나라별로 group by 하여 이용자 수를 distinct 하게 카운트 하였고, 나라별 총매출 컬럼을 만들었다.
+```{r}
+dbGetQuery(con,
+           "
+           SELECT country.country , count(distinct customer.customer_id) as customer_base , sum(payment.amount) as total_sale
+           FROM country
+           JOIN city
+           USING(country_id)
+           JOIN address
+           USING(city_id)
+           JOIN customer
+           USING(address_id)
+           JOIN payment
+           USING(customer_id)
+           group by 1
+           order by 2 DESC
+           ") %>% 
+  DT::datatable()
+```
+  
+인도와 중국 시장이 비중이 전체에서 매우 큼을 알 수 있다.  
+
+# TOPIC 6
+*"Who are the top 5 customers per total sales and can we get their details just in case Rent A Film wants to reward them?"*  
+  
+쿼리 작업 효율성 탐구를 위해 3가지 버전으로 쿼리를 작성해보았다.  
+결과는 모두 같게 나왔다.  
+  
+### TOPIC 6.1
+t1에서 구하려는 칼럼들을 조합하여 고객명 칼럼을 만들고 t1을 with로 최종 필요한 칼럼만 뽑아서 최종 테이블을 만들었다.
+```{r Q6 1}
+dbGetQuery(con,
+           "
+           WITH t1 AS (SELECT first_name||' '||last_name as full_name , email , country , city , address , phone , sum(amount) as Sales
+           FROM customer
+           JOIN payment
+           USING(customer_id)
+           JOIN address
+           USING(address_id)
+           JOIN city
+           USING(city_id)
+           JOIN country
+           USING(country_id)
+           
+           GROUP by 1,2,3,4,5,6
+           ORDER by 7 DESC
+           LIMIT 5
+           )
+           
+           SELECT full_name , email , country , city , address , phone , Sales
+           FROM t1
+           ") %>% 
+  DT::datatable()
+```
+
+### TOPIC 6.2
+t1에서 작업에 필요한 테이블과 칼럼들을 만들고, 후속 작업에서 열들을 조합해서 최종 필요한 고객 명 칼럼과 총매출 칼럼을 만들었다.
+```{r Q6 2}
+dbGetQuery(con,
+           "
+           WITH t1 AS (SELECT customer.* , amount , address , phone , city , country
+           FROM customer
+           JOIN payment
+           USING(customer_id)
+           JOIN address
+           USING(address_id)
+           JOIN city
+           USING(city_id)
+           JOIN country
+           USING(country_id)
+           )
+           
+           SELECT first_name||' '||last_name as full_name , email , country , city , address , phone , sum(amount) as Sales
+           FROM t1
+           
+           GROUP by 1,2,3,4,5,6
+           ORDER by 7 DESC
+           LIMIT 5
+           ") %>% 
+  DT::datatable()
+```
+
+### TOPIC 6.3
+처음부터 최종적으로 필요한 칼럼을 만들고, 남겨서 한번에 최종 테이블을 만들었다.
+```{r Q6 3}
+dbGetQuery(con,
+           "
+           SELECT first_name||' '||last_name as full_name , email , country , city , address , phone , sum(amount) as Sales
+           FROM customer
+           JOIN payment
+           USING(customer_id)
+           JOIN address
+           USING(address_id)
+           JOIN city
+           USING(city_id)
+           JOIN country
+           USING(country_id)
+           
+           GROUP by 1,2,3,4,5,6
+           ORDER by 7 DESC
+           LIMIT 5
+           ") %>% 
+  DT::datatable()
+```
+
+# 최종 Insight
+
+`TOPIC 1`  
+영화 장르별 렌트 수는 스포츠, 애니메이션, 액션 장르 순으로 TOP 3를 기록했다. 하지만 전체 매출량은 스포츠, 사이언스픽션, 애니메이션 순으로 TOP3를 기록했다. 스포츠 분야와 애니메이션이 DVD 장르에서 주요 상품 전력이고, 매출로 봤을 때는 사이언스픽션 영화가 크게 차지하므로 이들을 주력 매출 전략으로 삼을 수 있을 것 같다.  
+반면 음악, 여행, 호러 장르는 수요와 매출에서 하위 3위를 기록했다.  
+
+`TOPIC 2`  
+Distinct한 소비자 수를 보면 스포츠, 액션, 사이언스픽션 영화 장르가 많은 사람이 볼 법한 장르임을 알 수 있었다.  
+
+`TOPIC 3`  
+이전의 결과와 다르게 여행 분야가 평균 렌탈율이 높음을 알 수 있었다.  
+액션 분야가 최하위를 기록한 것으로 보아, 액션 장르는 가끔씩 한번 보는 영향이 있는 듯 하다.
+
+`TOPIC 4`  
+렌트 연체 된 사례가 생각보다 많아서, 연체에 패널티를 부여함으로써 수익 모델에 큰 비중을 차지할 수 있겠다. 하지만, 너무 심하면 고객층이 떨어져 나갈 수 있기에 적절한 조절이 필요할 것 같다.  
+
+`TOPIC 5`  
+인도와 중국에서 많은 고객 수요층과 매출액을 차지함을 알 수 있다. 전체 1,2위가 차지하는 비율이 전반적으로 비교했을 때 크므로, 인도와 중국 시장을 집중적으로 공략하는게 비즈니스 전략에 큰 도움이 될 것 같다.  
+또한, 상위 20% 나라가 전체 고객층의 80%를 차치하고 있으므로 주력 국가 대상을 정해서 마케팅 전략을 펼칠 수 있을 것 이다.
+  
+  
+> *인용 및 참고 사이트*  
+[How I analyzed DVD rental data with SQL, freeCodeCamp](https://www.freecodecamp.org/news/project-1-analyzing-dvd-rentals-with-sql-fd12dd674a64/)  
+[PostgreSQL Install, postgresqltutorial](http://www.postgresqltutorial.com/install-postgresql/)  
+[DVD Rental Database Download, postgresqltutorial](http://www.postgresqltutorial.com/postgresql-sample-database/)  
+[R에서 PostgreSQL 연동 하기, xwMOOC](https://statkclee.github.io/data-science/ds-postgreSQL.html)  
+[DVD Rental Database 인사이트 도출, xwMOOC](https://statkclee.github.io/data-science/ds-postgreSQL-insight.html)
